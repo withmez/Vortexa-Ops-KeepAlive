@@ -2,8 +2,11 @@ name: Vortexa Ops KeepAlive
 
 on:
   schedule:
-    - cron: '0 22 */3 * *'
+    - cron: '0 22 */3 * *' # 每3天 北京时间 06:00
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   keepalive:
@@ -11,6 +14,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        persist-credentials: true
 
     - uses: actions/setup-python@v5
       with:
@@ -29,7 +34,7 @@ jobs:
         TG_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       run: |
         python - << 'EOF'
-        import os, time, html, requests, re
+        import os, time, html, requests, re, sys
         from datetime import datetime
         from playwright.sync_api import sync_playwright
 
@@ -39,9 +44,6 @@ jobs:
         TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 
         BASE_URL = "https://www.vortexa.cloud/services"
-        TARGET_NODE = "4198"
-        URL = f"{BASE_URL}/{TARGET_NODE}"
-
         STATE_FILE = "state.json"
 
         def now():
@@ -61,73 +63,146 @@ jobs:
                 timeout=20
             )
 
-        with sync_playwright() as p:
+        print("BOOT VORTEXA AUTO KEEPALIVE - FULLY AUTOMATED MODE")
 
+        with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
             )
 
-            # ✅ 关键：加载 session
-            if os.path.exists(STATE_FILE):
-                context = browser.new_context(storage_state=STATE_FILE)
+            # Session 复用，防止由于反复异地账密登录触发严重风控
+            if os.path.exists(STATE_FILE) and os.path.getsize(STATE_FILE) > 0:
+                print("🔄 Loading existing session state...")
+                context = browser.new_context(
+                    storage_state=STATE_FILE,
+                    viewport={"width": 1440, "height": 900},
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                )
             else:
-                context = browser.new_context()
+                print("🆕 First run or empty state. Initializing clean context.")
+                context = browser.new_context(
+                    viewport={"width": 1440, "height": 900},
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                )
 
             page = context.new_page()
 
-            def login_if_needed():
-                page.goto(BASE_URL, wait_until="domcontentloaded")
-                time.sleep(3)
+            try:
+                # 1. 进入服务主页
+                print("🌐 Navigating to dashboard services list...")
+                page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
+                time.sleep(4)
 
+                # 2. 动态登录阻断
                 if "login" in page.url.lower() or page.locator("input[type=password]").count() > 0:
-
+                    print("🔑 Session expired or not logged in. Filling credentials...")
                     page.fill("input[type=email], input[name=email]", EMAIL)
                     page.fill("input[type=password], input[name=password]", PASSWORD)
-
                     page.click("button[type=submit], button:has-text('Log In'), button:has-text('Sign In')")
-                    page.wait_for_timeout(5000)
+                    
+                    page.wait_for_load_state("networkidle", timeout=60000)
+                    time.sleep(5)
 
-                    # ❗ 验证是否登录成功
                     if "login" in page.url.lower():
-                        raise Exception("Login failed (captcha or blocked)")
+                        raise Exception("Login failed (Blocked by Captcha/Shield or Incorrect Credentials)")
 
-                    # ✅ 保存 cookie/session
+                    # 登录成功，立即持久化
                     context.storage_state(path=STATE_FILE)
+                    print("💾 Fresh session saved successfully.")
 
-            try:
-                login_if_needed()
+                # 3. 重新对齐列表页，确认识别环境
+                page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
+                time.sleep(5)
 
-                page.goto(URL, wait_until="networkidle")
-                time.sleep(3)
+                # ⭐ 核心逻辑：利用高级定位符盲抓包含 Active 或 Running 的独立卡片/行组件
+                # 这样可以做到不管节点ID怎么变，只从状态为“存活”的容器块中抠链接
+                active_elements = page.locator("text=/^(Active|Running)$/i")
+                active_count = active_elements.count()
+                
+                print(f"Detected {active_count} explicit active/running state badge(s).")
 
-                if f"/services/{TARGET_NODE}" not in page.url:
-                    page.goto(URL)
-                    time.sleep(3)
+                selected_id = None
+                selected_url = None
+
+                for i in range(active_count):
+                    # 向上穿透拿到当前这一枚 Active 徽章所属的完整大父级容器（tr表格行 或 div卡片块）
+                    container = active_elements.nth(i).locator("xpath=ancestor::tr | ancestor::div[contains(@class,'card')] | ancestor::div[./a[contains(@href, '/services/')]]").first
+                    container_text = container.inner_text()
+                    
+                    # 严苛双向校验：如果在当前这块活动区域内倒霉地掺杂了 Cancelled 关键字，直接丢弃
+                    if "cancelled" in container_text.lower() or "suspended" in container_text.lower():
+                        continue
+                        
+                    # 从这栋合规的“存活大楼”里面，寻找跳转内页的 a 标签
+                    target_link = container.locator("a[href*='/services/']").first
+                    if target_link.count() > 0:
+                        href = target_link.get_attribute("href") or ""
+                        m = re.search(r"/services/(\d+)", href)
+                        if m:
+                            selected_id = m.group(1)
+                            selected_url = f"https://www.vortexa.cloud{href}"
+                            print(f"🎯 Automated Target Node Identified: #{selected_id}")
+                            break
+
+                # 4. Fallback 极端防呆机制：若因前端变动没捞到活鸡徽章，则保底取第一个不含死鸡关键字的链接
+                if not selected_id:
+                    print("⚠️ Active tracking isolated. Moving to safe list scanner fallback...")
+                    all_links = page.locator("a[href*='/services/']")
+                    for i in range(all_links.count()):
+                        link_locator = all_links.nth(i)
+                        href = link_locator.get_attribute("href") or ""
+                        m = re.search(r"/services/(\d+)", href)
+                        if m:
+                            row_text = link_locator.evaluate("el => el.closest('tr')?.innerText || el.closest('div')?.innerText || el.innerText").lower()
+                            if not any(x in row_text for x in ["cancelled", "suspended", "expired"]):
+                                selected_id = m.group(1)
+                                selected_url = f"https://www.vortexa.cloud{href}"
+                                print(f"Fallback secured normal node: #{selected_id}")
+                                break
+
+                if not selected_id:
+                    raise Exception("Process Terminated: Clear Active/Running instance could not be found.")
+
+                # 5. 跨入目标活鸡的内页控制台，完美触发 7 天保活机制
+                print(f"🚀 Triggering telemetry keepalive on: {selected_url}")
+                page.goto(selected_url, wait_until="networkidle", timeout=60000)
+                time.sleep(5)
+
+                if "login" in page.url.lower():
+                    raise Exception("Bypassed Warning: Auth session dropped during internal navigation.")
 
                 ts = now()
-
                 msg = (
                     "<b>🟢 VORTEXA KEEPALIVE SUCCESS</b>\n\n"
-                    f"<b>节点：</b><code>{TARGET_NODE}</code>\n"
-                    f"<b>模式：</b>Cookie Session KeepAlive\n"
-                    f"<b>时间：</b><code>{ts}</code>\n\n"
-                    f"<b>服务：</b>\n<a href='{URL}'>Open Panel</a>"
+                    f"<b>自动探测节点：</b><code>#{selected_id}</code>\n"
+                    f"<b>当前监测状态：</b>Active / Running 🟢\n"
+                    f"<b>动态保活周轮：</b>7天防删刷新已就绪\n\n"
+                    f"<b>最后巡检时间：</b><code>{ts}</code>\n\n"
+                    f"<b>快捷进入内页：</b>\n<a href='{selected_url}'>Open Service Dashboard</a>"
                 )
-
                 tg(msg)
                 print("SUCCESS")
 
             except Exception as e:
-                err = html.escape(str(e))
-
+                err_str = html.escape(str(e))
+                print(f"CRASHED: {err_str}")
                 tg(
-                    "<b>🔴 KEEPALIVE FAILED</b>\n\n"
-                    f"<code>{err}</code>\n\n"
-                    f"<b>时间：</b><code>{now()}</code>"
+                    "<b>🔴 VORTEXA KEEPALIVE FAILED</b>\n\n"
+                    f"<b>脚本阻断异常：</b><code>{err_str}</code>\n\n"
+                    f"<b>错误捕获时间：</b><code>{now()}</code>"
                 )
-                raise
-
+                sys.exit(1)
             finally:
                 browser.close()
         EOF
+
+    # 5. 自动把这次获取到的状态和时间提交存储，下一次跑就可以完美免密、全自适应空降运行
+    - name: Commit and Save Session State
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add state.json || true
+        echo "KeepAlive Timestamp: $(date -u)" > keepalive_telemetry.txt
+        git add keepalive_telemetry.txt
+        git diff --quiet && git diff --staged --quiet || (git commit -m "chore: auto-cycle dynamic session context [skip ci]" && git push)
