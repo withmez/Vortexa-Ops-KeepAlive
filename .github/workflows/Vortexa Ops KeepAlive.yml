@@ -104,33 +104,25 @@ jobs:
                     page.goto(BASE_URL, wait_until="networkidle", timeout=45000)
                     page.wait_for_timeout(4000)
 
-                # 2. 🔍 核心动态识别：提取真实行级 div 块并逐一智能判定
+                # 2. 🔍 核心动态识别：提取真实行级并筛选出 Active 节点
                 print("⚡ 开始解析当前账户下的行组件结构...")
-                
-                # 精准提取拥有跳转服务详情页链接的所有行容器块
                 rows = page.locator("div.divide-y > div")
                 row_count = rows.count()
                 print(f"当前页面共检测到 {row_count} 个服务卡片组件。")
                 
                 detected_node = None
-                
                 for i in range(row_count):
                     row_text = rows.nth(i).inner_text()
-                    
-                    # 严防死守：若这一行有 Cancelled 或者是死鸡标识，立马跳过
                     if "cancelled" in row_text.lower() or "never" in row_text.lower():
                         continue
-                        
-                    # 关键判定：这一行必须包含 Active 标识
                     if "active" in row_text.lower() or "running" in row_text.lower():
-                        # 利用正则抠出当前行文本里的纯数字节点 ID（例如 #4580 -> 4580）
                         id_match = re.search(r'#(\d+)', row_text)
                         if id_match:
                             detected_node = id_match.group(1)
                             print(f"🎯 成功识别出正在运行的活跃节点 ID: #{detected_node}")
                             break
 
-                # 3. 终极保底机制：万一容器遍历失败，扫描页面所有详情页链接，排除死节点
+                # 3. 链接过滤兜底
                 if not detected_node:
                     print("⚠️ 容器层未能精确定位，启动全页面链接过滤兜底...")
                     all_links = page.locator("a[href*='/services/']")
@@ -139,7 +131,6 @@ jobs:
                         href = link_locator.get_attribute("href") or ""
                         m = re.search(r"/services/(\d+)", href)
                         if m:
-                            # 向上追溯父级文本
                             parent_text = link_locator.evaluate("el => el.closest('div.flex-col')?.innerText || el.innerText").lower()
                             if "cancelled" not in parent_text and "never" not in parent_text:
                                 detected_node = m.group(1)
@@ -147,9 +138,9 @@ jobs:
                                 break
 
                 if not detected_node:
-                    raise Exception("在当前账户列表中未发现任何处于 Active / 正常运行状态的服务。")
+                    raise Exception("在当前账户列表中未发现任何处于 Active 正常运行状态的服务。")
 
-                # 4. 空降切入动态识别到的最新活鸡详情页
+                # 4. 进入详情页
                 target_url = f"https://www.vortexa.cloud/services/{detected_node}"
                 print(f"🚀 正在切入目标活跃服务详情页: {target_url}")
                 page.goto(target_url, wait_until="networkidle", timeout=45000)
@@ -157,30 +148,42 @@ jobs:
 
                 print("⚙️ 已成功进入服务详情页，保活访问已触发。")
 
-                # 5. 抓取创建时间并推算剩余天数
+                # 5. 抓取创建时间并推算剩余天数（双格式兼容性升级修复）
                 print("⏳ 正在提取机器到期指标...")
                 info_block = page.locator("div:has-text('Created:')").last
                 info_text = info_block.inner_text() if info_block.count() > 0 else page.locator("body").inner_text()
                 
-                clean_log_text = info_text.replace('\n', ' ')
+                clean_log_text = info_text.replace('\n', ' ').replace(',', '')
                 print(f"基础文本快照: {clean_log_text}")
 
-                date_match = re.search(r'Created:\s*([A-Za-z]+\s+\d{1,2},\s*\d{4})', info_text)
+                date_match = re.search(r'Created:\s*([A-Za-z]+\s+\d{1,2}\s+\d{4})', clean_log_text)
                 if not date_match:
-                    date_match = re.search(r'([A-Za-z]+\s+\d{1,2},\s*\d{4})', info_text)
+                    date_match = re.search(r'([A-Za-z]+\s+\d{1,2}\s+\d{4})', clean_log_text)
 
                 if date_match:
-                    created_date_str = date_match.group(1).replace(',', '')
-                    created_date = datetime.strptime(created_date_str, "%b %d %Y")
-                    expiry_date = created_date.replace(year=created_date.year + 1)
+                    created_date_str = date_match.group(1).strip()
+                    print(f"提取到的待解析日期字符串: '{created_date_str}'")
                     
+                    created_date = None
+                    for date_format in ("%B %d %Y", "%b %d %Y"):
+                        try:
+                            created_date = datetime.strptime(created_date_str, date_format)
+                            print(f"成功使用格式 '{date_format}' 完成解析！")
+                            break
+                        except ValueError:
+                            continue
+                    
+                    if not created_date:
+                        raise Exception(f"日期 '{created_date_str}' 无法匹配任何已知格式 (%B 或 %b)")
+
+                    expiry_date = created_date.replace(year=created_date.year + 1)
                     delta = expiry_date - datetime.utcnow()
                     remaining_days = max(0, delta.days)
-                    print(f"📆 机器创建于: {created_date_str} -> 推算到期日: {expiry_date.strftime('%Y-%m-%d')} -> 剩余: {remaining_days} 天")
+                    print(f"📆 机器创建于: {created_date.strftime('%Y-%m-%d')} -> 推算到期日: {expiry_date.strftime('%Y-%m-%d')} -> 剩余: {remaining_days} 天")
                     return remaining_days, detected_node, target_url
                 else:
                     page.screenshot(path="error.png", full_page=True)
-                    raise Exception("未能成功解析出详情页的创建日期，无法计算剩余天数。")
+                    raise Exception("未能成功从页面提取出任何有效的日期结构。")
 
             try:
                 days = None
