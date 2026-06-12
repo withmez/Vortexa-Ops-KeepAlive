@@ -32,7 +32,7 @@ jobs:
         TG_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       run: |
-        python - calculus - << 'EOF'
+        python - << 'EOF'
         import os
         import sys
         import time
@@ -47,7 +47,6 @@ jobs:
         TG_TOKEN = os.getenv("TG_BOT_TOKEN")
         TG_CHAT_ID = os.getenv("TG_CHAT_ID")
         
-        # 🎯 策略微调：第一步先进入大厅服务列表页
         BASE_URL = "https://www.vortexa.cloud/services"
 
         def tg(msg):
@@ -84,7 +83,7 @@ jobs:
             def core_keepalive_flow():
                 print("🌐 正在连接主服务列表页面...")
                 page.goto(BASE_URL, wait_until="domcontentloaded", timeout=45000)
-                page.wait_for_timeout(4000)
+                page.wait_for_timeout(5000)
 
                 # 1. 自动登录拦截
                 if page.locator("input[type='password']").count() > 0 or "login" in page.url.lower():
@@ -96,9 +95,8 @@ jobs:
                     submit_btn.click()
                     
                     page.wait_for_load_state("networkidle", timeout=45000)
-                    page.wait_for_timeout(5000)
+                    page.wait_for_timeout(6000)
 
-                # 确保登录完成后留存在列表页
                 if "login" in page.url.lower():
                     raise Exception("登录跳转失败，请检查账号密码配置。")
 
@@ -106,59 +104,60 @@ jobs:
                     page.goto(BASE_URL, wait_until="networkidle", timeout=45000)
                     page.wait_for_timeout(4000)
 
-                # 2. 🔍 核心动态识别：扫描当前所有状态，自动挑出真正的活跃服务
-                print("⚡ 开始盲搜当前账户下的活跃节点...")
-                active_badges = page.locator("text=/^(Active|Running)$/i")
-                active_count = active_badges.count()
+                # 2. 🔍 核心动态识别：提取真实行级 div 块并逐一智能判定
+                print("⚡ 开始解析当前账户下的行组件结构...")
+                
+                # 精准提取拥有跳转服务详情页链接的所有行容器块
+                rows = page.locator("div.divide-y > div")
+                row_count = rows.count()
+                print(f"当前页面共检测到 {row_count} 个服务卡片组件。")
                 
                 detected_node = None
                 
-                for i in range(active_count):
-                    # 向上穿透拿到该状态所在的整行或整块卡片
-                    container = active_badges.nth(i).locator("xpath=ancestor::tr | ancestor::div[contains(@class,'card')] | ancestor::div[./a[contains(@href, '/services/')]]").first
-                    container_text = container.inner_text()
+                for i in range(row_count):
+                    row_text = rows.nth(i).inner_text()
                     
-                    # 排除掉被注销的死节点
-                    if "cancelled" in container_text.lower() or "suspended" in container_text.lower():
+                    # 严防死守：若这一行有 Cancelled 或者是死鸡标识，立马跳过
+                    if "cancelled" in row_text.lower() or "never" in row_text.lower():
                         continue
-                    
-                    # 提取该区域内有效的详情页链接
-                    target_link = container.locator("a[href*='/services/']").first
-                    if target_link.count() > 0:
-                        href = target_link.get_attribute("href") or ""
-                        m = re.search(r"/services/(\d+)", href)
-                        if m:
-                            detected_node = m.group(1)
-                            print(f"🎯 成功自动识别到当前活跃节点: #{detected_node}")
+                        
+                    # 关键判定：这一行必须包含 Active 标识
+                    if "active" in row_text.lower() or "running" in row_text.lower():
+                        # 利用正则抠出当前行文本里的纯数字节点 ID（例如 #4580 -> 4580）
+                        id_match = re.search(r'#(\d+)', row_text)
+                        if id_match:
+                            detected_node = id_match.group(1)
+                            print(f"🎯 成功识别出正在运行的活跃节点 ID: #{detected_node}")
                             break
 
-                # 保底兜底：如果卡片组件太复杂没抓到，找第一个不含 cancelled 关键字的链接
+                # 3. 终极保底机制：万一容器遍历失败，扫描页面所有详情页链接，排除死节点
                 if not detected_node:
-                    print("⚠️ 未能通过状态块精确匹配，启动正常存活实例搜索保底...")
+                    print("⚠️ 容器层未能精确定位，启动全页面链接过滤兜底...")
                     all_links = page.locator("a[href*='/services/']")
                     for i in range(all_links.count()):
                         link_locator = all_links.nth(i)
                         href = link_locator.get_attribute("href") or ""
                         m = re.search(r"/services/(\d+)", href)
                         if m:
-                            row_text = link_locator.evaluate("el => el.closest('tr')?.innerText || el.closest('div')?.innerText || el.innerText").lower()
-                            if not any(x in row_text for x in ["cancelled", "suspended", "expired"]):
+                            # 向上追溯父级文本
+                            parent_text = link_locator.evaluate("el => el.closest('div.flex-col')?.innerText || el.innerText").lower()
+                            if "cancelled" not in parent_text and "never" not in parent_text:
                                 detected_node = m.group(1)
-                                print(f"保底命中正常节点: #{detected_node}")
+                                print(f"保底算法成功捕获到活鸡节点: #{detected_node}")
                                 break
 
                 if not detected_node:
-                    raise Exception("在当前账户中未发现任何处于 Active 状态的有效服务。")
+                    raise Exception("在当前账户列表中未发现任何处于 Active / 正常运行状态的服务。")
 
-                # 3. 跨入动态识别到的最新活鸡详情页，触发终极保活巡检
+                # 4. 空降切入动态识别到的最新活鸡详情页
                 target_url = f"https://www.vortexa.cloud/services/{detected_node}"
                 print(f"🚀 正在切入目标活跃服务详情页: {target_url}")
                 page.goto(target_url, wait_until="networkidle", timeout=45000)
-                page.wait_for_timeout(4000)
+                page.wait_for_timeout(5000)
 
-                print("⚙️ 已成功进入服务详情页，账号保活访问已触发。")
+                print("⚙️ 已成功进入服务详情页，保活访问已触发。")
 
-                # 4. 抓取创建时间并推算剩余天数
+                # 5. 抓取创建时间并推算剩余天数
                 print("⏳ 正在提取机器到期指标...")
                 info_block = page.locator("div:has-text('Created:')").last
                 info_text = info_block.inner_text() if info_block.count() > 0 else page.locator("body").inner_text()
