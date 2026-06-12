@@ -2,34 +2,26 @@ name: Vortexa Ops KeepAlive
 
 on:
   schedule:
-    - cron: '0 22 */3 * *'  # 每3天 UTC 22:00 = 北京时间 06:00
+    - cron: '0 22 */3 * *'
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   keepalive:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-      with:
-        persist-credentials: true
+    - uses: actions/checkout@v4
 
-    - name: Setup Python
-      uses: actions/setup-python@v5
+    - uses: actions/setup-python@v5
       with:
         python-version: '3.11'
 
-    - name: Install Dependencies
+    - name: Install
       run: |
-        python -m pip install --upgrade pip
         pip install playwright requests
         python -m playwright install chromium --with-deps
 
-    - name: Run KeepAlive
+    - name: Run
       env:
         VORTEXA_EMAIL: ${{ secrets.VORTEXA_EMAIL }}
         VORTEXA_PASSWORD: ${{ secrets.VORTEXA_PASSWORD }}
@@ -37,11 +29,7 @@ jobs:
         TG_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       run: |
         python - << 'EOF'
-        import os
-        import re
-        import time
-        import html
-        import requests
+        import os, time, html, requests, re
         from datetime import datetime
         from playwright.sync_api import sync_playwright
 
@@ -51,164 +39,95 @@ jobs:
         TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 
         BASE_URL = "https://www.vortexa.cloud/services"
+        TARGET_NODE = "4198"
+        URL = f"{BASE_URL}/{TARGET_NODE}"
+
+        STATE_FILE = "state.json"
 
         def now():
             return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        def tg(message: str):
+        def tg(msg):
             if not TG_TOKEN or not TG_CHAT_ID:
-                print("TG not configured")
                 return
-            try:
-                resp = requests.post(
-                    f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                    json={
-                        "chat_id": TG_CHAT_ID,
-                        "text": message,
-                        "parse_mode": "HTML",
-                        "disable_web_page_preview": True
-                    },
-                    timeout=20
-                )
-                resp.raise_for_status()
-            except Exception as e:
-                print(f"TG ERROR: {e}")
-
-        print("BOOT VORTEXA AUTO KEEPALIVE")
+            requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                json={
+                    "chat_id": TG_CHAT_ID,
+                    "text": msg,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True
+                },
+                timeout=20
+            )
 
         with sync_playwright() as p:
-            # ✔️ 补丁 4：补充 --disable-gpu，配合 Actions 无显卡环境
+
             browser = p.chromium.launch(
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
             )
 
-            context = browser.new_context(
-                viewport={"width": 1440, "height": 900},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            )
+            # ✅ 关键：加载 session
+            if os.path.exists(STATE_FILE):
+                context = browser.new_context(storage_state=STATE_FILE)
+            else:
+                context = browser.new_context()
+
             page = context.new_page()
 
+            def login_if_needed():
+                page.goto(BASE_URL, wait_until="domcontentloaded")
+                time.sleep(3)
+
+                if "login" in page.url.lower() or page.locator("input[type=password]").count() > 0:
+
+                    page.fill("input[type=email], input[name=email]", EMAIL)
+                    page.fill("input[type=password], input[name=password]", PASSWORD)
+
+                    page.click("button[type=submit], button:has-text('Log In'), button:has-text('Sign In')")
+                    page.wait_for_timeout(5000)
+
+                    # ❗ 验证是否登录成功
+                    if "login" in page.url.lower():
+                        raise Exception("Login failed (captcha or blocked)")
+
+                    # ✅ 保存 cookie/session
+                    context.storage_state(path=STATE_FILE)
+
             try:
-                # 1. 进入 services 页面
-                page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
-                time.sleep(4)
+                login_if_needed()
 
-                # 2. 判断并执行登录
-                if page.locator("input[type='password']").count() > 0 or "login" in page.url.lower():
-                    print("LOGIN REQUIRED")
+                page.goto(URL, wait_until="networkidle")
+                time.sleep(3)
 
-                    page.locator("input[type='email'], input[name='email']").first.fill(EMAIL)
-                    page.locator("input[type='password'], input[name='password']").first.fill(PASSWORD)
-
-                    page.locator("button[type='submit'], button:has-text('Log In'), button:has-text('Sign In')").first.click()
-
-                    page.wait_for_load_state("networkidle", timeout=60000)
-                    time.sleep(5)
-
-                # ✔️ 补丁 3：登录硬校验。如果依然卡在登录页或 URL 带有 login，直接抛出异常阻断
-                if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
-                    raise Exception("Login failed! Account credentials might be invalid or blocked by Captcha.")
-
-                # 3. 回到 services 页面
-                page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
-                time.sleep(4)
-
-                # 4. 提取所有 service 链接
-                links = page.locator("a[href*='/services/']")
-                count = links.count()
-
-                if count == 0:
-                    raise Exception("No services found in account")
-
-                selected_id = None
-                selected_url = None
-
-                # ✔️ 补丁 1：通过强大的 JS 向上穿透组件（.closest），抓取包含 Badger 状态的整行/卡片文本
-                print(f"Total service links found: {count}. Scanning for active node...")
-                for i in range(count):
-                    link_locator = links.nth(i)
-                    href = link_locator.get_attribute("href") or ""
-
-                    if not re.search(r"/services/\d+", href):
-                        continue
-
-                    # 获取包裹该链接的整行 tr 或大 div 的 innerText
-                    row_text = link_locator.evaluate("el => el.closest('tr')?.innerText || el.closest('div')?.innerText || el.innerText").lower()
-
-                    # 状态精细筛选：包含 active/running，但必须排除被取消、挂起或过期的死节点
-                    if (("active" in row_text) or ("running" in row_text)) and not any(x in row_text for x in ["cancelled", "suspended", "expired"]):
-                        m = re.search(r"/services/(\d+)", href)
-                        if m:
-                            selected_id = m.group(1)
-                            selected_url = f"https://www.vortexa.cloud{href}"
-                            print(f"🎯 Precise Active Node Match Success: {selected_id}")
-                            break
-
-                # ✔️ 补丁 2：更安全的 fallback。如果没找到 active 标签，过滤掉死节点，找第一个存活的链接
-                if not selected_id:
-                    print("⚠️ No explicitly marked active nodes found. Running safe fallback...")
-                    for i in range(count):
-                        link_locator = links.nth(i)
-                        href = link_locator.get_attribute("href") or ""
-                        m = re.search(r"/services/(\d+)", href)
-                        if m:
-                            row_text = link_locator.evaluate("el => el.closest('tr')?.innerText || el.closest('div')?.innerText || el.innerText").lower()
-                            if not any(x in row_text for x in ["cancelled", "suspended", "expired"]):
-                                selected_id = m.group(1)
-                                selected_url = f"https://www.vortexa.cloud{href}"
-                                print(f"Fallback selected surviving node: {selected_id}")
-                                break
-
-                if not selected_id:
-                    raise Exception("Cannot parse any available or surviving service ID")
-
-                # 5. 进入服务详情页触发最终保活
-                print(f"🌐 Navigating to Target Service Page: {selected_url}")
-                page.goto(selected_url, wait_until="networkidle", timeout=60000)
-                time.sleep(5)
-
-                if f"/services/{selected_id}" not in page.url:
-                    raise Exception(f"Failed to enter service page: {page.url}")
+                if f"/services/{TARGET_NODE}" not in page.url:
+                    page.goto(URL)
+                    time.sleep(3)
 
                 ts = now()
 
-                # ✔️ 补丁 5：重新规范整合、更漂亮标准化的 Telegram 生产级通知排版
                 msg = (
                     "<b>🟢 VORTEXA KEEPALIVE SUCCESS</b>\n\n"
-                    f"<b>节点：</b><code>{selected_id}</code>\n"
-                    f"<b>状态：</b>Active Refresh OK\n\n"
-                    f"<b>规则：</b>7天内已完成活跃刷新\n"
-                    f"<b>最后保活：</b><code>{ts}</code>\n\n"
-                    f"<b>服务链接：</b>\n<a href=\"{selected_url}\">Open Service Panel</a>"
+                    f"<b>节点：</b><code>{TARGET_NODE}</code>\n"
+                    f"<b>模式：</b>Cookie Session KeepAlive\n"
+                    f"<b>时间：</b><code>{ts}</code>\n\n"
+                    f"<b>服务：</b>\n<a href='{URL}'>Open Panel</a>"
                 )
 
                 tg(msg)
-                print("SUCCESS KEEPALIVE DONE")
+                print("SUCCESS")
 
             except Exception as e:
-                err = str(e)
-                safe_err = html.escape(err[:300])
+                err = html.escape(str(e))
 
-                msg = (
-                    "<b>🚨 VORTEXA KEEPALIVE FAILED</b>\n\n"
-                    f"<b>错误：</b><code>{safe_err}</code>\n\n"
-                    f"<b>时间：</b><code>{now()}</code>\n\n"
-                    "<b>建议：</b>请前往 GitHub 检查登录凭证或 error.png 截图。"
+                tg(
+                    "<b>🔴 KEEPALIVE FAILED</b>\n\n"
+                    f"<code>{err}</code>\n\n"
+                    f"<b>时间：</b><code>{now()}</code>"
                 )
-
-                tg(msg)
-                print("FAILED:", err)
                 raise
 
             finally:
                 browser.close()
         EOF
-
-    - name: Keep Github Workflow Active
-      run: |
-        echo "Last KeepAlive Sync: $(date -u)" > keepalive_status.txt
-        git config --global user.name "github-actions[bot]"
-        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        git add keepalive_status.txt
-        git diff --quiet && git diff --staged --quiet || (git commit -m "chore: update keepalive telemetry timestamp [skip ci]" && git push)
