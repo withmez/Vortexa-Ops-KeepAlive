@@ -7,7 +7,6 @@ import os
 import re
 import time
 import base64
-from bs4 import BeautifulSoup
 from curl_cffi import requests
 
 try:
@@ -22,46 +21,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class VortexaKeepAlive:
-    def __init__(self, cookie_str, tg_config=None):
-        self.base_url = "https://dash.vortexa.com"
-        self.cookie_str = cookie_str
+class VortexaCloudKeepAlive:
+    def __init__(self, auth_token, tg_config=None):
+        # 1. 靶向定位你抓出来的全新 API 地址
+        self.api_url = "https://api.vortexa.cloud/api/hosting/free/status"
+        self.auth_token = auth_token.strip()
         self.tg_config = tg_config
-        # 模拟真实浏览器指纹，完美绕过 Cloudflare 安全盾
+        # 模拟真实 Edge/Chrome 混合指纹，完美穿透防御
         self.session = requests.Session(impersonate="chrome110")
-        self.username = "Unknown"
-        self.balance = "未知"
-        self.csrf_token = ""
-        self.parse_and_set_cookies()
+        self.username = "云 API 托管账户"
 
-    def parse_and_set_cookies(self):
-        """解析并注入 Cookie"""
-        if not self.cookie_str:
-            return
-        cookies = {}
-        for item in self.cookie_str.split(';'):
-            if '=' in item:
-                parts = item.strip().split('=', 1)
-                if len(parts) == 2:
-                    cookies[parts[0]] = parts[1]
-        self.session.cookies.update(cookies)
-
-    def get_cookie_string(self):
-        """生成当前最新 Cookie 字符串"""
-        return "; ".join([f"{k}={v}" for k, v in self.session.cookies.items()])
-
-    def update_github_secret(self, new_cookie):
-        """持久化：自动回写覆盖 GitHub Secret，保持 Cookie 永久不死"""
+    def update_github_secret(self, current_token):
+        """持久化：如果后续需要更新或重写，利用 PAT 保持 Secret 覆盖能力"""
         gh_pat = os.environ.get("GH_PAT")
         repo = os.environ.get("GITHUB_REPOSITORY")
-        secret_name = "VORTEXA_COOKIE"
+        secret_name = "VORTEXA_COOKIE"  # 变量名保持不变，防止你重新去改 Actions 变量名
 
-        if not gh_pat or not repo:
-            logger.warning("⚠️ 未配置 GH_PAT 或不在 Actions 环境中，跳过 Cookie 自动回写")
-            return
-
-        if not HAS_NACL:
-            logger.error("❌ 未安装 pynacl 库，无法加密并更新 Secret")
+        if not gh_pat or not repo or not HAS_NACL:
             return
 
         headers = {
@@ -80,7 +56,7 @@ class VortexaKeepAlive:
 
             public_key_obj = public.PublicKey(public_key.encode("utf-8"), encoding.Base64Encoder())
             sealed_box = public.SealedBox(public_key_obj)
-            encrypted = sealed_box.encrypt(new_cookie.encode("utf-8"))
+            encrypted = sealed_box.encrypt(current_token.encode("utf-8"))
             encrypted_value = base64.b64encode(encrypted).decode("utf-8")
 
             self.session.put(
@@ -88,19 +64,9 @@ class VortexaKeepAlive:
                 headers=headers,
                 json={"encrypted_value": encrypted_value, "key_id": key_id}
             )
-            logger.info(f"✅ GitHub Secret [{secret_name}] 自动自愈回写成功！")
+            logger.info("✅ GitHub Secret 凭证持久化同步成功！")
         except Exception as e:
             logger.error(f"❌ 自动更新 Secret 出错: {e}")
-
-    def get_hitokoto(self):
-        """TG 推送：每日一言"""
-        try:
-            resp = requests.get("https://v1.hitokoto.cn/?encode=json", timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                return f"『{data['hitokoto']}』—— {data['from']}"
-        except Exception: pass
-        return "保持热爱，奔赴山海。"
 
     def send_tg_notification(self, message):
         """TG 推送功能"""
@@ -108,142 +74,75 @@ class VortexaKeepAlive:
             return
 
         url = f"https://api.telegram.org/bot{self.tg_config['bot_token']}/sendMessage"
-        hitokoto = self.get_hitokoto()
         formatted_message = (
-            f"☁️ **Vortexa 7天周期活跃保活报告**\n"
+            f"☁️ **Vortexa API 实例保活报告**\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"👤 **账户**: `{self.username}`\n"
-            f"💰 **余额**: `{self.balance}`\n"
-            f"🕒 **时间**: `{time.strftime('%Y-%m-%d %H:%M:%S')}`\n"
+            f"👤 **凭证标识**: `Bearer Token`\n"
+            f"🕒 **维保时间**: `{time.strftime('%Y-%m-%d %H:%M:%S')}`\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"{message}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"💡 **每日一言**:\n_{hitokoto}_"
+            f"💡 状态提示：已按照 2-3 天周期成功提交网络活跃流量"
         )
 
         payload = {"chat_id": self.tg_config["chat_id"], "text": formatted_message, "parse_mode": "Markdown"}
         try:
             self.session.post(url, json=payload, timeout=10)
-        except Exception as e:
-            logger.error(f"TG 推送失败: {e}")
+        except Exception: pass
 
-    def get_csrf_token(self, html):
-        """解析页面 Token"""
-        if not html: return None
-        soup = BeautifulSoup(html, 'html.parser')
-        token_meta = soup.find('meta', attrs={'name': 'csrf-token'})
-        if token_meta: self.csrf_token = token_meta.get('content')
-        return self.csrf_token
+    def do_keepalive(self):
+        """核心保活：直接往 API 接口轰炸状态请求，100%产生有登入特征的流量记录 (Traffic)"""
+        # 组装跟你抓包一模一样的全量高级请求头
+        headers = {
+            "accept": "*/*",
+            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+            "authorization": f"Bearer {self.auth_token}", # 👈 动态注入你的核心密钥
+            "content-type": "application/json",
+            "sec-ch-ua": '"Microsoft Edge";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-site",
+            "x-fingerprint": "a9076b31f4616d9beee9446fa4f2c22f", # 固化防爬虫设备指纹
+            "Referer": "https://www.vortexa.cloud/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0"
+        }
 
-    def check_login(self):
-        """核心功能1：自动登录打卡（产生 Active Login 记录）"""
         try:
-            resp = self.session.get(f"{self.base_url}/dashboard", timeout=20, allow_redirects=True)
-            if "/login" in resp.url: return False
-                
+            # 向后端提交心跳流量，获取当前免费托管服务的状态列表
+            resp = self.session.get(self.api_url, headers=headers, timeout=25)
+            
             if resp.status_code == 200:
-                self.get_csrf_token(html=resp.text)
-                soup = BeautifulSoup(resp.text, 'html.parser')
+                logger.info("✅ 成功穿透 Cloudflare 并向云端 API 刷新了活跃记录！")
+                # 尝试解析官方返回的实例状态
+                try:
+                    res_json = resp.json()
+                    status_msg = f"✅ **保活成功**\n\n接口返回元数据片段:\n`{str(res_json)[:150]}...`"
+                except Exception:
+                    status_msg = "✅ **保活成功**\n\n接口响应 200 OK，活跃流量记录已成功刷新。"
                 
-                # 提取用户名
-                email_tag = soup.select_one('p.font-light.text-gray-500') or soup.find('p', string=re.compile(r'.+@.+\..+'))
-                if email_tag and "[email" not in email_tag.get_text():
-                    self.username = email_tag.get_text().strip()
-                
-                # 提取账户余额
-                balance_link = soup.select_one('a[href*="/balance"]')
-                if balance_link:
-                    balance_tag = balance_link.find(['dt', 'h4', 'div'], class_=re.compile(r'font-extrabold|text-3xl'))
-                    if balance_tag: self.balance = balance_tag.get_text().strip()
-                
-                logger.info(f"✅ 成功刷新登入记录！账户: {self.username} | 余额: {self.balance}")
+                self.send_tg_notification(status_msg)
+                # 触发持久化回写
+                self.update_github_secret(self.auth_token)
                 return True
+            elif resp.status_code == 401:
+                logger.error("❌ 接口返回 401 Unauthorized：你的 Bearer Token 已经完全失效或复制错了！")
+                self.send_tg_notification("❌ **保活失败**\n\n接口提示 Token 认证未通过（401），请重新抓取替换。")
+                return False
+            else:
+                logger.warning(f"⚠️ 接口请求异常，状态码: {resp.status_code}")
+                self.send_tg_notification(f"⚠️ **保活异常**\n\n接口响应非预期状态码: `{resp.status_code}`")
+                return False
         except Exception as e:
-            logger.error(f"校验登入活跃失败: {e}")
-        return False
-
-    def get_service_ids(self):
-        """提取服务器实例 ID"""
-        try:
-            resp = self.session.get(f"{self.base_url}/dashboard", timeout=20)
-            return list(set(re.findall(r'service/(\d+)/manage', resp.text)))
-        except Exception as e:
-            logger.error(f"提取实例失败: {e}")
-            return []
-
-    def generate_traffic_and_pay(self, service_id):
-        """核心功能2+3：产生实际流量记录 (Traffic) 并在必要时自动用余额扣费"""
-        manage_url = f"{self.base_url}/service/{service_id}/manage"
-        try:
-            # 1. 访问管理页，获取控制台元数据，向后端触发实例活跃流量 (Traffic)
-            resp = self.session.get(manage_url, timeout=20)
-            token = self.get_csrf_token(html=resp.text)
-            
-            traffic_status = "成功 (已触发控制台交互流量)"
-
-            # 2. 自动扣费兜底：检测到未支付订单时自动用账户余额支付
-            invoice_list_url = f"{self.base_url}/service/{service_id}/invoices?where=unpaid"
-            inv_resp = self.session.get(invoice_list_url, timeout=20)
-            inv_soup = BeautifulSoup(inv_resp.text, 'html.parser')
-            invoice_links = [a['href'] for a in inv_soup.find_all('a', href=True) if '/invoice/' in a['href'] and 'download' not in a['href']]
-            
-            pay_status = "无需处理"
-            if invoice_links:
-                pay_count = 0
-                for inv_link in list(set(invoice_links)):
-                    if not inv_link.startswith('http'): inv_link = self.base_url + inv_link
-                    item_resp = self.session.get(inv_link, timeout=20)
-                    item_soup = BeautifulSoup(item_resp.text, 'html.parser')
-                    
-                    pay_form = None
-                    for form in item_soup.find_all('form'):
-                        if 'balance/add' in form.get('action', ''): continue
-                        pay_form = form
-                        break
-                    
-                    if pay_form:
-                        action = pay_form.get('action', '')
-                        if not action.startswith('http'): action = self.base_url + action
-                        payload = {inp.get('name'): inp.get('value', '') for inp in pay_form.find_all('input') if inp.get('name')}
-                        if token: payload['_token'] = token
-                        
-                        pay_res = self.session.post(action, data=payload, headers={"Referer": inv_link}, timeout=20)
-                        if "成功" in pay_res.text or "Success" in pay_res.text or pay_res.status_code == 200:
-                            pay_count += 1
-                if pay_count > 0: pay_status = f"✅ 自动余额扣费成功 ({pay_count}笔)"
-
-            return True, traffic_status, pay_status
-        except Exception as e:
-            return False, f"流量保活异常: {e}", "处理失败"
-
-    def run_task(self):
-        if not self.check_login():
-            logger.error("❌ 任务终止：VORTEXA_COOKIE 完全失效。")
-            self.send_tg_notification("❌ 账户认证失效！请手动重新在浏览器里抓取 Cookie 并覆盖 GitHub Secrets。")
-            return
-
-        service_ids = self.get_service_ids()
-        if not service_ids:
-            logger.warning("账户中无活跃实例。")
-            return
-
-        results = []
-        for s_id in service_ids:
-            _, t_msg, p_msg = self.generate_traffic_and_pay(s_id)
-            results.append(f"🖥️ **实例 ID: {s_id}**\n   ├ 流量活跃: `{t_msg}`\n   └ 余额扣费: `{p_msg}`")
-
-        # 发送通知
-        self.send_tg_notification("\n".join(results))
-
-        # 持久化：更新 GitHub 里的 Cookie
-        new_cookie_str = self.get_cookie_string()
-        if "vortexa_session" in new_cookie_str and new_cookie_str != self.cookie_str:
-            self.update_github_secret(new_cookie_str)
+            logger.error(f"❌ 请求云端保活发生物理网络异常: {e}")
+            return False
 
 def main():
-    env_cookies = os.environ.get("VORTEXA_COOKIE")
-    if not env_cookies:
-        logger.error("❌ 缺少 VORTEXA_COOKIE 环境变量。")
+    # 兼容老配置，你不需要在 GitHub 里修改变量名，继续在这个变量里填 Token 即可
+    env_tokens = os.environ.get("VORTEXA_COOKIE")
+    if not env_tokens:
+        logger.error("❌ 缺少核心凭证环境变量。")
         return
 
     tg_config = {
@@ -251,13 +150,19 @@ def main():
         "chat_id": os.environ.get("TG_CHAT_ID")
     }
 
-    # 支持多账号：用 & 或换行符隔开
-    account_cookies = re.split(r'[&\n]', env_cookies)
-    for cookie_str in account_cookies:
-        if not cookie_str.strip(): continue
+    # 依然完美兼容多账号：用 & 或换行符隔开多个 Token 字符串即可
+    tokens = re.split(r'[&\n]', env_tokens)
+    for token_str in tokens:
+        if not token_str.strip(): continue
         try:
-            bot = VortexaKeepAlive(cookie_str.strip(), tg_config)
-            bot.run_task()
+            # 如果不小心把整段 fetch 贴进去了，自动帮你把 Bearer Token 抠出来
+            pure_token = token_str
+            if "Bearer " in token_str:
+                match = re.search(r'Bearer\s+([a-zA-Z0-9_\-\.]+)', token_str)
+                if match: pure_token = match.group(1)
+            
+            bot = VortexaCloudKeepAlive(pure_token, tg_config)
+            bot.do_keepalive()
         except Exception as e:
             logger.error(f"执行异常: {e}")
 
