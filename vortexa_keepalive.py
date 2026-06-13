@@ -28,7 +28,7 @@ class VortexaCloudKeepAlive:
         self.tg_config = tg_config
         self.session = requests.Session(impersonate="chrome110")
         
-        # 全自动捕获参数（若账单接口成功解析，这些值将被完美动态替换）
+        # 个人信息初始兜底
         self.username = "未知账户"
         self.balance = "$0.00"
         
@@ -36,7 +36,7 @@ class VortexaCloudKeepAlive:
         self.success_count = 0
         self.failed_count = 0
         
-        # 严格复刻你提供的 Edge 抓包高级请求头
+        # 严格复刻 Edge 抓包高级请求头
         self.headers = {
             "accept": "*/*",
             "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
@@ -64,7 +64,7 @@ class VortexaCloudKeepAlive:
         return "既然认准这条路，何必去打听要走多久。—— 网络"
 
     def check_invoices_and_extract_profile(self):
-        """【主线一：账单与扣费】并动态提取个人身份画像"""
+        """【主线一：账单与扣费】并全自动动态提取个人资料"""
         try:
             resp = self.session.get("https://api.vortexa.cloud/api/platform/invoices", headers=self.headers, timeout=12)
             if resp.status_code == 200:
@@ -72,7 +72,7 @@ class VortexaCloudKeepAlive:
                 unpaid_count = 0
                 
                 if isinstance(invoices, list) and len(invoices) > 0:
-                    # 💡 核心注入：从最新的账单中，100% 全自动提炼客户真实的 Name 和 Email 组合
+                    # 从账单 100% 全自动提炼真实的姓名和邮箱组合
                     first_invoice = invoices[0]
                     customer = first_invoice.get("customer", {})
                     c_name = customer.get("name")
@@ -85,12 +85,12 @@ class VortexaCloudKeepAlive:
                     elif c_email:
                         self.username = c_email
                     
-                    # 动态适配账单中的真实币种
+                    # 动态适配账单里的真实币种
                     curr = first_invoice.get("currency_code", "USD")
                     curr_symbol = "$" if curr == "USD" else "€"
                     self.balance = f"{curr_symbol}0.00"
 
-                    # 循环检测并支付未结账单
+                    # 循环检测并扣款未结账单
                     for inv in invoices:
                         status = str(inv.get("status", "")).lower()
                         if status in ["unpaid", "pending", "待支付", "未支付"]:
@@ -113,7 +113,7 @@ class VortexaCloudKeepAlive:
             return f"❌ 账单监控: 网络连接异常 ({str(e)})"
 
     def keepalive_login_task(self):
-        """【主线二：7天活跃登录保活】"""
+        """【主线二：7天活跃登录保活】检测清退死线"""
         try:
             resp = self.session.get("https://api.vortexa.cloud/api/hosting/free/status", headers=self.headers, timeout=15)
             if resp.status_code == 200:
@@ -135,7 +135,7 @@ class VortexaCloudKeepAlive:
             return f"❌ 登录保活: 打卡网络异常 ({str(e)})"
 
     def update_github_secret(self, current_token):
-        """持久化自动更新 Token 防止 401 断联"""
+        """持久化自动更新 Token"""
         gh_pat = os.environ.get("GH_PAT")
         repo = os.environ.get("GITHUB_REPOSITORY")
         secret_name = "VORTEXA_COOKIE"
@@ -164,7 +164,7 @@ class VortexaCloudKeepAlive:
         except Exception: pass
 
     def send_tg_notification(self, content_message):
-        """高复刻可视化推送排版"""
+        """完美组装包含云朵头像和高复刻款样式的 TG 模板"""
         if not self.tg_config or not self.tg_config.get("bot_token") or not self.tg_config.get("chat_id"):
             return
 
@@ -174,7 +174,9 @@ class VortexaCloudKeepAlive:
         pure_hitokoto = hitokoto.split('——')[0].replace('『','').replace('』','').strip()
         author = hitokoto.split('——')[1].strip() if '——' in hitokoto else '网络'
 
+        # 💡 核心注入：在最顶部加上带云朵图标的大报告标题
         full_message = (
+            f"☁️ **Vortexa 保活报告**\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"👤 **账号**: {self.username}\n"
             f"💰 **余额**: {self.balance}\n"
@@ -191,14 +193,14 @@ class VortexaCloudKeepAlive:
         except Exception: pass
 
     def run_task(self):
-        # 1. 率先拉取账单并全自动抓取提炼里面的个人资料
+        # 1. 率先拉取账单并全自动提取画像
         invoice_report = self.check_invoices_and_extract_profile()
-        # 2. 独立执行 7 天登录保活
+        # 2. 独立运行保活打卡
         keepalive_report = self.keepalive_login_task()
         
         full_report_body = f"{keepalive_report}\n{invoice_report}"
         
-        # 3. 发送完美报告与令牌续期自愈
+        # 3. 发送带新头像标题的完美报告并回写 Token 续命
         self.send_tg_notification(full_report_body)
         self.update_github_secret(self.auth_token)
 
