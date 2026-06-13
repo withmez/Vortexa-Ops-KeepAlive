@@ -27,7 +27,7 @@ class VortexaKeepAlive:
         self.base_url = "https://dash.vortexa.com"
         self.cookie_str = cookie_str
         self.tg_config = tg_config
-        # 模拟真实浏览器指纹，绕过底层 Cloudflare 校验
+        # 模拟真实浏览器指纹，完美绕过 Cloudflare 安全盾
         self.session = requests.Session(impersonate="chrome110")
         self.username = "Unknown"
         self.balance = "未知"
@@ -51,7 +51,7 @@ class VortexaKeepAlive:
         return "; ".join([f"{k}={v}" for k, v in self.session.cookies.items()])
 
     def update_github_secret(self, new_cookie):
-        """持久化：配合 GitHub PAT 自动回写覆盖 Cookie，防止频繁手动更新"""
+        """持久化：自动回写覆盖 GitHub Secret，保持 Cookie 永久不死"""
         gh_pat = os.environ.get("GH_PAT")
         repo = os.environ.get("GITHUB_REPOSITORY")
         secret_name = "VORTEXA_COOKIE"
@@ -110,7 +110,7 @@ class VortexaKeepAlive:
         url = f"https://api.telegram.org/bot{self.tg_config['bot_token']}/sendMessage"
         hitokoto = self.get_hitokoto()
         formatted_message = (
-            f"☁️ **Vortexa 7天双重活跃保活报告**\n"
+            f"☁️ **Vortexa 7天周期活跃保活报告**\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"👤 **账户**: `{self.username}`\n"
             f"💰 **余额**: `{self.balance}`\n"
@@ -136,7 +136,7 @@ class VortexaKeepAlive:
         return self.csrf_token
 
     def check_login(self):
-        """自动续期功能：执行登入记录保活"""
+        """核心功能1：自动登录打卡（产生 Active Login 记录）"""
         try:
             resp = self.session.get(f"{self.base_url}/dashboard", timeout=20, allow_redirects=True)
             if "/login" in resp.url: return False
@@ -172,16 +172,16 @@ class VortexaKeepAlive:
             return []
 
     def generate_traffic_and_pay(self, service_id):
-        """核心保活：产生实际流量记录 (Traffic) 并自动扣费兜底"""
+        """核心功能2+3：产生实际流量记录 (Traffic) 并在必要时自动用余额扣费"""
         manage_url = f"{self.base_url}/service/{service_id}/manage"
         try:
-            # 1. 访问管理页，获取控制台元数据，模拟真实的控制台流量握手
+            # 1. 访问管理页，获取控制台元数据，向后端触发实例活跃流量 (Traffic)
             resp = self.session.get(manage_url, timeout=20)
             token = self.get_csrf_token(html=resp.text)
             
-            traffic_status = "成功 (已触发控制台网络流量握手)"
+            traffic_status = "成功 (已触发控制台交互流量)"
 
-            # 2. 自动扣费：检测到未支付订单时自动用账户余额支付
+            # 2. 自动扣费兜底：检测到未支付订单时自动用账户余额支付
             invoice_list_url = f"{self.base_url}/service/{service_id}/invoices?where=unpaid"
             inv_resp = self.session.get(invoice_list_url, timeout=20)
             inv_soup = BeautifulSoup(inv_resp.text, 'html.parser')
@@ -230,7 +230,7 @@ class VortexaKeepAlive:
         results = []
         for s_id in service_ids:
             _, t_msg, p_msg = self.generate_traffic_and_pay(s_id)
-            results.append(f"🖥️ **实例 ID: {s_id}**\n   ├ 流量记录: `{t_msg}`\n   └ 余额扣费: `{p_msg}`")
+            results.append(f"🖥️ **实例 ID: {s_id}**\n   ├ 流量活跃: `{t_msg}`\n   └ 余额扣费: `{p_msg}`")
 
         # 发送通知
         self.send_tg_notification("\n".join(results))
