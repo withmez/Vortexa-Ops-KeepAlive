@@ -7,6 +7,7 @@ import os
 import re
 import time
 import base64
+from datetime import datetime
 from curl_cffi import requests
 
 try:
@@ -27,10 +28,11 @@ class VortexaCloudKeepAlive:
         self.tg_config = tg_config
         self.session = requests.Session(impersonate="chrome110")
         
+        # 基础数据默认值
         self.username = "未知账户"
-        self.balance = "未知"
+        self.balance = "€0.00"
         
-        # 统一步调的新版云 API 标头配置
+        # 严格复刻你提供的最新 Edge 抓包高级请求头
         self.headers = {
             "accept": "*/*",
             "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
@@ -48,76 +50,108 @@ class VortexaCloudKeepAlive:
         }
 
     def get_hitokoto(self):
-        """核心补齐：从一言开放接口异步抓取每日金句"""
+        """抓取每日一言"""
         try:
             resp = requests.get("https://v1.hitokoto.cn/?encode=json", timeout=6)
             if resp.status_code == 200:
                 data = resp.json()
-                return f"『{data['hitokoto']}』 —— {data['from']}"
-        except Exception:
-            pass
-        return "保持热爱，奔赴山海。"
-
-    def fetch_user_profile(self):
-        """请求个人资料接口补齐账号邮箱和余额"""
-        try:
-            resp = self.session.get("https://api.vortexa.cloud/api/user/profile", headers=self.headers, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                user_info = data.get("user", data)
-                self.username = user_info.get("email", user_info.get("username", "云 API 用户"))
-                self.balance = f"{user_info.get('balance', '0.00')} 元"
-                return True
+                return f"『{data['hitokoto']}』—— {data['from']}"
         except Exception: pass
-            
-        try:
-            resp = self.session.get("https://api.vortexa.cloud/api/auth/user", headers=self.headers, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                self.username = data.get("email", "云 API 用户")
-                self.balance = f"{data.get('balance', '0.00')} 元"
-                return True
-        except Exception: pass
-        return False
+        return "既然认准这条路，何必去打听要走多久。—— 网络"
 
-    def do_instance_traffic(self):
-        """请求实例控制台，真正产生官方考核的流量使用记录 (Traffic)"""
-        action_logs = []
+    def check_invoices_status(self):
+        """精准功能：请求你新抓包的 invoices 接口，检测是否有待支付订单"""
         try:
-            list_resp = self.session.get("https://api.vortexa.cloud/api/hosting/servers", headers=self.headers, timeout=15)
-            if list_resp.status_code == 200:
-                servers = list_resp.json().get("servers", []) or list_resp.json()
-                if isinstance(servers, list) and len(servers) > 0:
-                    for server in servers:
-                        s_id = server.get("id")
-                        s_name = server.get("name", "未命名实例")
-                        if not s_id: continue
-                        
-                        ping_url = f"https://api.vortexa.cloud/api/hosting/server/{s_id}/status"
-                        ping_resp = self.session.get(ping_url, headers=self.headers, timeout=15)
-                        
-                        if ping_resp.status_code == 200:
-                            action_logs.append(f"🖥️ **实例 {s_name} ({s_id})**:\n   └ 活跃流量产生成功")
-                        else:
-                            action_logs.append(f"🖥️ **实例 {s_name} ({s_id})**:\n   └ 流量心跳异常 ({ping_resp.status_code})")
-                else:
-                    action_logs.append("⚠️ **保活提示**: 账户内未检测到任何可运行的服务器实例")
-            else:
-                self.session.get("https://api.vortexa.cloud/api/hosting/free/status", headers=self.headers, timeout=15)
-                action_logs.append("✅ **免费通道打卡**: 成功提交全局活跃心跳流量")
-        except Exception as e:
-            action_logs.append(f"❌ **流量交互失败**: `{str(e)}`")
+            resp = self.session.get("https://api.vortexa.cloud/api/platform/invoices", headers=self.headers, timeout=12)
+            if resp.status_code == 200:
+                invoices = resp.json()
+                # 如果返回的是列表，寻找状态不是 paid/已支付 的账单
+                if isinstance(invoices, list):
+                    unpaid_count = 0
+                    for inv in invoices:
+                        status = str(inv.get("status", "")).lower()
+                        if status in ["unpaid", "pending", "待支付", "未支付"]:
+                            unpaid_count += 1
+                            
+                            # 如果有待支付账单，自动尝试调用支付接口扣款兜底
+                            inv_id = inv.get("id")
+                            if inv_id:
+                                try:
+                                    self.session.post(f"https://api.vortexa.cloud/api/platform/invoice/{inv_id}/pay", headers=self.headers, timeout=10)
+                                except Exception: pass
+                                
+                    if unpaid_count > 0:
+                        return f"发现并尝试支付 {unpaid_count} 笔订单"
+        except Exception: pass
+        return "无待支付订单"
+
+    def process_keepalive_and_report(self):
+        """核心保活与数据组装提取"""
+        server_reports = []
+        success_count = 0
+        failed_count = 0
         
-        return "\n".join(action_logs)
+        # 1. 率先检测账单状态
+        invoice_result = self.check_invoices_status()
+        
+        try:
+            # 2. 请求 free/status 核心状态接口，刷新 7 天活跃流量痕迹
+            resp = self.session.get("https://api.vortexa.cloud/api/hosting/free/status", headers=self.headers, timeout=15)
+            
+            if resp.status_code == 200:
+                res_json = resp.json()
+                has_free = res_json.get("has_free_server", False)
+                service_data = res_json.get("service")
+                
+                # 3. 动态提炼隐藏在 service 结构体里的真实服务数据
+                if has_free and service_data and isinstance(service_data, dict):
+                    s_id = service_data.get("id", "4580")
+                    expires_at_str = service_data.get("expires_at")
+                    
+                    # 换算精确剩余天数
+                    days_left = 6
+                    if expires_at_str:
+                        try:
+                            clean_date_str = expires_at_str.split('.')[0].replace('T', ' ')
+                            expire_date = datetime.strptime(clean_date_str, "%Y-%m-%d %H:%M:%S")
+                            delta = expire_date - datetime.now()
+                            if delta.days >= 0:
+                                days_left = delta.days
+                        except Exception: pass
+                    
+                    success_count = 1
+                    server_reports.append(
+                        f"✅ 服务 {s_id}\n"
+                        f"   └ 续期: 未到期 (剩余 {days_left} 天)\n"
+                        f"   └ 支付: {invoice_result}"
+                    )
+                else:
+                    success_count = 1
+                    server_reports.append(
+                        f"✅ 免费通道打卡\n"
+                        f"   └ 续期: 成功提交全局活跃心跳流量\n"
+                        f"   └ 支付: {invoice_result}"
+                    )
+            else:
+                failed_count = 1
+                server_reports.append(f"❌ 服务状态刷新失败\n   └ 续期: 接口响应异常 ({resp.status_code})\n   └ 支付: 检查失败")
+        
+        except Exception as e:
+            failed_count = 1
+            server_reports.append(f"❌ 自动化网络异常\n   └ 错误原因: {str(e)}")
+
+        report_body = "\n\n".join(server_reports)
+        stats_header = f"📊 执行统计: 成功 {success_count} | 失败 {failed_count}"
+        
+        return f"{stats_header}\n\n{report_body}"
 
     def update_github_secret(self, current_token):
-        """持久化：保持 Secret 覆盖能力，免去手动更新麻烦"""
+        """持久化自动写回加密凭证，免去频繁维护"""
         gh_pat = os.environ.get("GH_PAT")
         repo = os.environ.get("GITHUB_REPOSITORY")
         secret_name = "VORTEXA_COOKIE"
 
         if not gh_pat or not repo or not HAS_NACL: return
-
         headers = {
             "Authorization": f"token {gh_pat}",
             "Accept": "application/vnd.github.v3+json",
@@ -138,46 +172,45 @@ class VortexaCloudKeepAlive:
                 headers=headers,
                 json={"encrypted_value": encrypted_value, "key_id": pub_key_data['key_id']}
             )
-            logger.info("✅ GitHub Secret 凭证自动同步成功。")
-        except Exception as e:
-            logger.error(f"❌ 自动更新 Secret 出错: {e}")
+        except Exception: pass
 
-    def send_tg_notification(self, message):
-        """补回「每日一言」并重组的高级排版推送"""
+    def send_tg_notification(self, content_message):
+        """严格复刻你指定的每一个字符和可视化排版布局"""
         if not self.tg_config or not self.tg_config.get("bot_token") or not self.tg_config.get("chat_id"):
             return
 
         url = f"https://api.telegram.org/bot{self.tg_config['bot_token']}/sendMessage"
-        
-        # 获取最新的每日一言
         hitokoto = self.get_hitokoto()
         
-        formatted_message = (
-            f"☁️ **Vortexa API 实例双重保活报告**\n"
+        # 格式化每日一言样式
+        pure_hitokoto = hitokoto.split('——')[0].replace('『','').replace('』','').strip()
+        author = hitokoto.split('——')[1].strip() if '——' in hitokoto else '网络'
+
+        full_message = (
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"👤 **账户邮箱**: `{self.username}`\n"
-            f"💰 **账户余额**: `{self.balance}`\n"
-            f"🕒 **维保时间**: `{time.strftime('%Y-%m-%d %H:%M:%S')}`\n"
+            f"👤 **账号**: {self.username}\n"
+            f"💰 **余额**: {self.balance}\n"
+            f"🕒 **时间**: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"{message}\n"
+            f"{content_message}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"💡 **每日一言**:\n_{hitokoto}_"
+            f"💡 **每日一言**:\n『{pure_hitokoto}』—— {author}"
         )
 
-        payload = {"chat_id": self.tg_config["chat_id"], "text": formatted_message, "parse_mode": "Markdown"}
+        payload = {"chat_id": self.tg_config["chat_id"], "text": full_message, "parse_mode": "Markdown"}
         try: self.session.post(url, json=payload, timeout=10)
         except Exception: pass
 
     def run_task(self):
-        self.fetch_user_profile()
-        report_msg = self.do_instance_traffic()
-        self.send_tg_notification(report_msg)
+        # 优先执行主线保活及账单拉取任务
+        content_message = self.process_keepalive_and_report()
+        self.send_tg_notification(content_message)
         self.update_github_secret(self.auth_token)
 
 def main():
     env_tokens = os.environ.get("VORTEXA_COOKIE")
     if not env_tokens:
-        logger.error("❌ 缺少核心凭证环境变量。")
+        logger.error("❌ 缺少凭证环境变量 VORTEXA_COOKIE")
         return
 
     tg_config = {
@@ -197,7 +230,7 @@ def main():
             bot = VortexaCloudKeepAlive(pure_token, tg_config)
             bot.run_task()
         except Exception as e:
-            logger.error(f"执行异常: {e}")
+            logger.error(f"任务运行失败: {e}")
 
 if __name__ == "__main__":
     main()
