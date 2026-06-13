@@ -1,243 +1,35 @@
-name: Vortexa Ops KeepAlive
+name: Vortexa 7-Day Activity KeepAlive
 
 on:
   schedule:
-    # 北京时间每 3 天的清晨 06:00 自动运行一次
-    - cron: '0 22 */3 * *'
-  workflow_dispatch:
+    # 每天北京时间早上 09:30 定时运行，确保 7 天内有充足的活跃记录
+    - cron: '0 */3 * * *'
+  workflow_dispatch: # 支持手动点击按钮触发测试
 
 jobs:
   keepalive:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-    - name: Setup Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-    - name: Install Dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install playwright requests
-        python -m playwright install chromium --with-deps
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install curl_cffi beautifulsoup4 pynacl
 
-    - name: Run Ops KeepAlive
-      env:
-        VORTEXA_EMAIL: ${{ secrets.VORTEXA_EMAIL }}
-        VORTEXA_PASSWORD: ${{ secrets.VORTEXA_PASSWORD }}
-        TG_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TG_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      run: |
-        python - << 'EOF'
-        import os
-        import sys
-        import time
-        import html
-        import re
-        import requests
-        from datetime import datetime
-        from playwright.sync_api import sync_playwright
-
-        EMAIL = os.getenv("VORTEXA_EMAIL")
-        PASSWORD = os.getenv("VORTEXA_PASSWORD")
-        TG_TOKEN = os.getenv("TG_BOT_TOKEN")
-        TG_CHAT_ID = os.getenv("TG_CHAT_ID")
-        
-        BASE_URL = "https://www.vortexa.cloud/services"
-
-        def tg(msg):
-            if not TG_TOKEN or not TG_CHAT_ID:
-                print("TG 未配置")
-                return
-            url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-            try:
-                requests.post(url, json={
-                    "chat_id": TG_CHAT_ID,
-                    "text": msg,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True
-                }, timeout=20)
-            except Exception as e:
-                print(f"TG 发送失败: {e}")
-
-        def now():
-            return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-
-        print("BOOT OPS SYSTEM - AUTOMATIC NODE DETECTION")
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
-            )
-            context = browser.new_context(
-                viewport={"width": 1440, "height": 900},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            )
-            page = context.new_page()
-
-            def core_keepalive_flow():
-                print("🌐 正在连接主服务列表页面...")
-                page.goto(BASE_URL, wait_until="domcontentloaded", timeout=45000)
-                page.wait_for_timeout(5000)
-
-                # 1. 自动登录拦截
-                if page.locator("input[type='password']").count() > 0 or "login" in page.url.lower():
-                    print("🔑 LOGIN REQUIRED - 触发自动登录...")
-                    page.locator("input[type='email'], input[name='email']").first.fill(EMAIL)
-                    page.locator("input[type='password'], input[name='password']").first.fill(PASSWORD)
-                    
-                    submit_btn = page.locator("button[type='submit'], button:has-text('Log In'), button:has-text('Sign In')").first
-                    submit_btn.click()
-                    
-                    page.wait_for_load_state("networkidle", timeout=45000)
-                    page.wait_for_timeout(6000)
-
-                if "login" in page.url.lower():
-                    raise Exception("登录跳转失败，请检查账号密码配置。")
-
-                if "/services" not in page.url:
-                    page.goto(BASE_URL, wait_until="networkidle", timeout=45000)
-                    page.wait_for_timeout(4000)
-
-                # 2. 🔍 核心动态识别：提取真实行级并筛选出 Active 节点
-                print("⚡ 开始解析当前账户下的行组件结构...")
-                rows = page.locator("div.divide-y > div")
-                row_count = rows.count()
-                print(f"当前页面共检测到 {row_count} 个服务卡片组件。")
-                
-                detected_node = None
-                for i in range(row_count):
-                    row_text = rows.nth(i).inner_text()
-                    if "cancelled" in row_text.lower() or "never" in row_text.lower():
-                        continue
-                    if "active" in row_text.lower() or "running" in row_text.lower():
-                        id_match = re.search(r'#(\d+)', row_text)
-                        if id_match:
-                            detected_node = id_match.group(1)
-                            print(f"🎯 成功识别出正在运行的活跃节点 ID: #{detected_node}")
-                            break
-
-                # 3. 链接过滤兜底
-                if not detected_node:
-                    print("⚠️ 容器层未能精确定位，启动全页面链接过滤兜底...")
-                    all_links = page.locator("a[href*='/services/']")
-                    for i in range(all_links.count()):
-                        link_locator = all_links.nth(i)
-                        href = link_locator.get_attribute("href") or ""
-                        m = re.search(r"/services/(\d+)", href)
-                        if m:
-                            parent_text = link_locator.evaluate("el => el.closest('div.flex-col')?.innerText || el.innerText").lower()
-                            if "cancelled" not in parent_text and "never" not in parent_text:
-                                detected_node = m.group(1)
-                                print(f"保底算法成功捕获到活鸡节点: #{detected_node}")
-                                break
-
-                if not detected_node:
-                    raise Exception("在当前账户列表中未发现任何处于 Active 正常运行状态的服务。")
-
-                # 4. 进入详情页
-                target_url = f"https://www.vortexa.cloud/services/{detected_node}"
-                print(f"🚀 正在切入目标活跃服务详情页: {target_url}")
-                page.goto(target_url, wait_until="networkidle", timeout=45000)
-                page.wait_for_timeout(5000)
-
-                print("⚙️ 已成功进入服务详情页，保活访问已触发。")
-
-                # 5. 抓取创建时间并推算剩余天数（双格式兼容性升级修复）
-                print("⏳ 正在提取机器到期指标...")
-                info_block = page.locator("div:has-text('Created:')").last
-                info_text = info_block.inner_text() if info_block.count() > 0 else page.locator("body").inner_text()
-                
-                clean_log_text = info_text.replace('\n', ' ').replace(',', '')
-                print(f"基础文本快照: {clean_log_text}")
-
-                date_match = re.search(r'Created:\s*([A-Za-z]+\s+\d{1,2}\s+\d{4})', clean_log_text)
-                if not date_match:
-                    date_match = re.search(r'([A-Za-z]+\s+\d{1,2}\s+\d{4})', clean_log_text)
-
-                if date_match:
-                    created_date_str = date_match.group(1).strip()
-                    print(f"提取到的待解析日期字符串: '{created_date_str}'")
-                    
-                    created_date = None
-                    for date_format in ("%B %d %Y", "%b %d %Y"):
-                        try:
-                            created_date = datetime.strptime(created_date_str, date_format)
-                            print(f"成功使用格式 '{date_format}' 完成解析！")
-                            break
-                        except ValueError:
-                            continue
-                    
-                    if not created_date:
-                        raise Exception(f"日期 '{created_date_str}' 无法匹配任何已知格式 (%B 或 %b)")
-
-                    expiry_date = created_date.replace(year=created_date.year + 1)
-                    delta = expiry_date - datetime.utcnow()
-                    remaining_days = max(0, delta.days)
-                    print(f"📆 机器创建于: {created_date.strftime('%Y-%m-%d')} -> 推算到期日: {expiry_date.strftime('%Y-%m-%d')} -> 剩余: {remaining_days} 天")
-                    return remaining_days, detected_node, target_url
-                else:
-                    page.screenshot(path="error.png", full_page=True)
-                    raise Exception("未能成功从页面提取出任何有效的日期结构。")
-
-            try:
-                days = None
-                active_id = None
-                active_url = None
-                max_retries = 3
-                
-                for attempt in range(max_retries):
-                    try:
-                        days, active_id, active_url = core_keepalive_flow()
-                        break
-                    except Exception as flow_err:
-                        print(f"⚠️ 第 {attempt + 1} 次尝试失败: {flow_err}")
-                        if attempt == max_retries - 1:
-                            raise
-                        time.sleep(10)
-
-                ts = now()
-                status_color = "🟢 正常" if days > 30 else "🟠 警告" if days > 10 else "🔴 临界"
-
-                msg = "<b>🖥 VORTEXA 自动保活监控</b>\n\n"
-                msg += f"<b>运行状态</b>\n{status_color}\n\n"
-                msg += f"<b>剩余续期</b>\n<b>{days} 天</b>\n\n"
-                msg += f"<b>服务节点</b>\n<code>#{active_id}</code>\n\n"
-                msg += f"<b>控制面板</b>\n<a href=\"{active_url}\">打开当前服务内页</a>\n\n"
-                msg += f"<b>检测时间</b>\n<code>{ts}</code>"
-
-                tg(msg)
-                print("SUCCESS: MONITOR CARD SENT")
-
-            except Exception as e:
-                err_str = str(e)
-                print(f"CRASH: {err_str}")
-                try:
-                    page.screenshot(path="error.png", full_page=True)
-                except:
-                    pass
-
-                safe_error = html.escape(err_str[:250])
-                fail_msg = "<b>🚨 VORTEXA 保活运行失败</b>\n\n"
-                fail_msg += f"<b>失败时间</b>\n<code>{now()}</code>\n\n"
-                fail_msg += f"<b>错误日志</b>\n<code>{safe_error}</code>\n\n"
-                fail_msg += "<b>处理建议</b>\n请前往 Actions 查看 error.png 截图确定原因。"
-
-                tg(fail_msg)
-                sys.exit(1)
-            finally:
-                browser.close()
-        EOF
-
-    - name: Upload Error Screenshot
-      if: failure()
-      uses: actions/upload-artifact@v4
-      with:
-        name: error-screenshot
-        path: error.png
-        if-no-files-found: ignore
+      - name: Run Vortexa Active Task
+        env:
+          VORTEXA_COOKIE: ${{ secrets.VORTEXA_COOKIE }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python vortexa_keepalive.py
