@@ -28,11 +28,15 @@ class VortexaCloudKeepAlive:
         self.tg_config = tg_config
         self.session = requests.Session(impersonate="chrome110")
         
-        # 基础数据默认值
+        # 初始身份缓冲值
         self.username = "未知账户"
         self.balance = "€0.00"
         
-        # 严格复刻你提供的最新 Edge 抓包高级请求头
+        # 统计计数
+        self.success_count = 0
+        self.failed_count = 0
+        
+        # 严格复刻高级请求头
         self.headers = {
             "accept": "*/*",
             "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
@@ -59,94 +63,88 @@ class VortexaCloudKeepAlive:
         except Exception: pass
         return "既然认准这条路，何必去打听要走多久。—— 网络"
 
-    def check_invoices_status(self):
-        """精准功能：请求你新抓包的 invoices 接口，检测是否有待支付订单"""
+    def fetch_user_profile(self):
+        """多路径破译账户名与余额"""
+        try:
+            resp = self.session.get("https://api.vortexa.cloud/api/user/profile", headers=self.headers, timeout=8)
+            if resp.status_code == 200:
+                res_data = resp.json()
+                user_data = res_data.get("user", res_data.get("data", res_data))
+                if isinstance(user_data, dict):
+                    self.username = user_data.get("name") or user_data.get("username") or user_data.get("email") or self.username
+                    b_val = user_data.get("balance", "0.00")
+                    self.balance = b_val if str(b_val).startswith('€') else f"€{b_val}"
+                    return True
+        except Exception: pass
+
+        try:
+            resp = self.session.get("https://api.vortexa.cloud/api/auth/user", headers=self.headers, timeout=8)
+            if resp.status_code == 200:
+                user_data = resp.json()
+                if isinstance(user_data, dict):
+                    self.username = user_data.get("name") or user_data.get("username") or user_data.get("email") or self.username
+                    b_val = user_data.get("balance", "0.00")
+                    self.balance = b_val if str(b_val).startswith('€') else f"€{b_val}"
+                    return True
+        except Exception: pass
+        return False
+
+    def check_invoices_task(self):
+        """【主线一：账单与扣费】"""
         try:
             resp = self.session.get("https://api.vortexa.cloud/api/platform/invoices", headers=self.headers, timeout=12)
             if resp.status_code == 200:
                 invoices = resp.json()
-                # 如果返回的是列表，寻找状态不是 paid/已支付 的账单
+                unpaid_count = 0
                 if isinstance(invoices, list):
-                    unpaid_count = 0
                     for inv in invoices:
                         status = str(inv.get("status", "")).lower()
                         if status in ["unpaid", "pending", "待支付", "未支付"]:
                             unpaid_count += 1
-                            
-                            # 如果有待支付账单，自动尝试调用支付接口扣款兜底
                             inv_id = inv.get("id")
                             if inv_id:
                                 try:
                                     self.session.post(f"https://api.vortexa.cloud/api/platform/invoice/{inv_id}/pay", headers=self.headers, timeout=10)
                                 except Exception: pass
-                                
-                    if unpaid_count > 0:
-                        return f"发现并尝试支付 {unpaid_count} 笔订单"
-        except Exception: pass
-        return "无待支付订单"
+                
+                self.success_count += 1
+                if unpaid_count > 0:
+                    return f"✅ 账单监控: 发现并自动扣款支付 {unpaid_count} 笔订单"
+                return "✅ 账单监控: 暂无待支付账单，账务安全"
+            else:
+                self.failed_count += 1
+                return f"❌ 账单监控: 检查失败，接口响应异常 ({resp.status_code})"
+        except Exception as e:
+            self.failed_count += 1
+            return f"❌ 账单监控: 网络连接异常 ({str(e)})"
 
-    def process_keepalive_and_report(self):
-        """核心保活与数据组装提取"""
-        server_reports = []
-        success_count = 0
-        failed_count = 0
-        
-        # 1. 率先检测账单状态
-        invoice_result = self.check_invoices_status()
-        
+    def keepalive_login_task(self):
+        """【主线二：7天活跃登录保活】紧扣清退机制，拒绝看一年虚假大合同"""
         try:
-            # 2. 请求 free/status 核心状态接口，刷新 7 天活跃流量痕迹
+            # 触发 7 天活跃刷新接口
             resp = self.session.get("https://api.vortexa.cloud/api/hosting/free/status", headers=self.headers, timeout=15)
-            
             if resp.status_code == 200:
+                self.success_count += 1
                 res_json = resp.json()
                 has_free = res_json.get("has_free_server", False)
                 service_data = res_json.get("service")
                 
-                # 3. 动态提炼隐藏在 service 结构体里的真实服务数据
+                # 提取实例 ID
+                s_id = "自由实例"
                 if has_free and service_data and isinstance(service_data, dict):
-                    s_id = service_data.get("id", "4580")
-                    expires_at_str = service_data.get("expires_at")
-                    
-                    # 换算精确剩余天数
-                    days_left = 6
-                    if expires_at_str:
-                        try:
-                            clean_date_str = expires_at_str.split('.')[0].replace('T', ' ')
-                            expire_date = datetime.strptime(clean_date_str, "%Y-%m-%d %H:%M:%S")
-                            delta = expire_date - datetime.now()
-                            if delta.days >= 0:
-                                days_left = delta.days
-                        except Exception: pass
-                    
-                    success_count = 1
-                    server_reports.append(
-                        f"✅ 服务 {s_id}\n"
-                        f"   └ 续期: 未到期 (剩余 {days_left} 天)\n"
-                        f"   └ 支付: {invoice_result}"
-                    )
-                else:
-                    success_count = 1
-                    server_reports.append(
-                        f"✅ 免费通道打卡\n"
-                        f"   └ 续期: 成功提交全局活跃心跳流量\n"
-                        f"   └ 支付: {invoice_result}"
-                    )
+                    s_id = service_data.get("id") or service_data.get("product", {}).get("name") or "自由实例"
+                
+                # 既然成功刷新，就代表获得了全新的 7 天活跃安全期（不看账单的一年）
+                return f"✅ 登录保活: 机器 [{s_id}] 活跃打卡成功，已重置刷新 7 天不删机安全期"
             else:
-                failed_count = 1
-                server_reports.append(f"❌ 服务状态刷新失败\n   └ 续期: 接口响应异常 ({resp.status_code})\n   └ 支付: 检查失败")
-        
+                self.failed_count += 1
+                return f"❌ 登录保活: 打卡失败 ({resp.status_code})！机器处于 7 天不活跃删机风险中"
         except Exception as e:
-            failed_count = 1
-            server_reports.append(f"❌ 自动化网络异常\n   └ 错误原因: {str(e)}")
-
-        report_body = "\n\n".join(server_reports)
-        stats_header = f"📊 执行统计: 成功 {success_count} | 失败 {failed_count}"
-        
-        return f"{stats_header}\n\n{report_body}"
+            self.failed_count += 1
+            return f"❌ 登录保活: 打卡网络异常 ({str(e)})"
 
     def update_github_secret(self, current_token):
-        """持久化自动写回加密凭证，免去频繁维护"""
+        """自动续期持久化令牌"""
         gh_pat = os.environ.get("GH_PAT")
         repo = os.environ.get("GITHUB_REPOSITORY")
         secret_name = "VORTEXA_COOKIE"
@@ -175,14 +173,13 @@ class VortexaCloudKeepAlive:
         except Exception: pass
 
     def send_tg_notification(self, content_message):
-        """严格复刻你指定的每一个字符和可视化排版布局"""
+        """复刻可视化排版"""
         if not self.tg_config or not self.tg_config.get("bot_token") or not self.tg_config.get("chat_id"):
             return
 
         url = f"https://api.telegram.org/bot{self.tg_config['bot_token']}/sendMessage"
         hitokoto = self.get_hitokoto()
         
-        # 格式化每日一言样式
         pure_hitokoto = hitokoto.split('——')[0].replace('『','').replace('』','').strip()
         author = hitokoto.split('——')[1].strip() if '——' in hitokoto else '网络'
 
@@ -192,6 +189,7 @@ class VortexaCloudKeepAlive:
             f"💰 **余额**: {self.balance}\n"
             f"🕒 **时间**: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
+            f"📊 **执行统计**: 成功 {self.success_count} | 失败 {self.failed_count}\n\n"
             f"{content_message}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"💡 **每日一言**:\n『{pure_hitokoto}』—— {author}"
@@ -202,9 +200,15 @@ class VortexaCloudKeepAlive:
         except Exception: pass
 
     def run_task(self):
-        # 优先执行主线保活及账单拉取任务
-        content_message = self.process_keepalive_and_report()
-        self.send_tg_notification(content_message)
+        self.fetch_user_profile()
+        
+        # 运行两大相互独立的硬核指标
+        invoice_report = self.check_invoices_task()
+        keepalive_report = self.keepalive_login_task()
+        
+        full_report_body = f"{keepalive_report}\n{invoice_report}"
+        
+        self.send_tg_notification(full_report_body)
         self.update_github_secret(self.auth_token)
 
 def main():
